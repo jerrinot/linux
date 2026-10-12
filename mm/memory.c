@@ -4478,8 +4478,14 @@ static inline void unmap_mapping_range_tree(struct address_space *mapping,
 					    struct zap_details *details)
 {
 	struct vm_area_struct *vma;
+	struct mm_struct *mm = NULL;
 	struct mmu_gather tlb;
 
+	/*
+	 * One gather per run of VMAs of the same mm, so that a file mapped many
+	 * times by one process costs one TLB flush per truncate instead of one
+	 * per VMA. The i_mmap lock keeps the VMAs and their mms alive.
+	 */
 	mapping_rmap_tree_foreach(vma, mapping, first_index, last_index) {
 		const pgoff_t start_idx = max(first_index, vma_start_pgoff(vma));
 		const pgoff_t end_idx = min(last_index, vma_last_pgoff(vma)) + 1;
@@ -4488,10 +4494,16 @@ static inline void unmap_mapping_range_tree(struct address_space *mapping,
 		const unsigned long start = vma->vm_start + offset_bytes;
 		const unsigned long size = (end_idx - start_idx) << PAGE_SHIFT;
 
-		tlb_gather_mmu(&tlb, vma->vm_mm);
+		if (vma->vm_mm != mm) {
+			if (mm)
+				tlb_finish_mmu(&tlb);
+			mm = vma->vm_mm;
+			tlb_gather_mmu(&tlb, mm);
+		}
 		zap_vma_range_batched(&tlb, vma, start, size, details);
-		tlb_finish_mmu(&tlb);
 	}
+	if (mm)
+		tlb_finish_mmu(&tlb);
 }
 
 /**
