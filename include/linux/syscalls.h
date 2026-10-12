@@ -796,6 +796,7 @@ asmlinkage long sys_recvmsg(int fd, struct user_msghdr __user *msg, unsigned fla
 asmlinkage long sys_readahead(int fd, loff_t offset, size_t count);
 asmlinkage long sys_brk(unsigned long brk);
 asmlinkage long sys_munmap(unsigned long addr, size_t len);
+asmlinkage long sys_munmapv(const struct iovec __user *uvec, unsigned int nr);
 asmlinkage long sys_mremap(unsigned long addr,
 			   unsigned long old_len, unsigned long new_len,
 			   unsigned long flags, unsigned long new_addr);

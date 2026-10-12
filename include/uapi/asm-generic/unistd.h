@@ -868,7 +868,11 @@ __SYSCALL(__NR_rseq_slice_yield, sys_rseq_slice_yield)
 __SYSCALL(__NR_fchroot, sys_fchroot)
 
 #undef __NR_syscalls
-#define __NR_syscalls 473
+#define __NR_munmapv 473
+__SYSCALL(__NR_munmapv, sys_munmapv)
+
+#undef __NR_syscalls
+#define __NR_syscalls 474
 
 /*
  * 32 bit systems traditionally used different

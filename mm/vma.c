@@ -1692,6 +1692,201 @@ gather_failed:
 }
 
 /*
+ * do_munmapv() - munmap a vector of page-aligned, sorted, non-overlapping ranges
+ * with a single page table walk and a single TLB flush.
+ * @mm: The mm_struct
+ * @rng: The ranges (page aligned, sorted by start, non-overlapping)
+ * @nr: Number of ranges
+ * @uf: The userfaultfd list_head
+ *
+ * Called with the mmap write lock held. Every range is first detached from
+ * the vma tree (point of no return per range), then the lock is downgraded,
+ * all PTEs are zapped and page tables freed into one mmu_gather, and the
+ * accounting is finished. Like munmap(), the lock is dropped on return.
+ * Page tables are freed against the *live* neighbours of each range, so
+ * tables shared between two ranges of the batch are freed too.
+ *
+ * Return: 0 on success. On error, ranges detached before the failure are
+ * still unmapped, the rest is untouched; -errno is returned.
+ */
+int do_munmapv(struct mm_struct *mm, struct munmapv_range *rng, unsigned int nr,
+	       struct list_head *uf)
+{
+	struct vma_munmap_struct *vms;
+	struct vma_iterator *vmis;
+	struct maple_tree *mts;
+	struct ma_state *mas;
+	struct mmu_gather tlb;
+	unsigned long *live_end;
+	unsigned int i, j, done = 0;
+	int prev_real, error = 0;
+
+	live_end = kvmalloc_array(nr, sizeof(*live_end), GFP_KERNEL);
+	vms = kvmalloc_array(nr, sizeof(*vms), GFP_KERNEL);
+	vmis = kvmalloc_array(nr, sizeof(*vmis), GFP_KERNEL);
+	mts = kvmalloc_array(nr, sizeof(*mts), GFP_KERNEL);
+	mas = kvmalloc_array(nr, sizeof(*mas), GFP_KERNEL);
+	if (!vms || !vmis || !mts || !mas || !live_end) {
+		mmap_write_unlock(mm);
+		error = -ENOMEM;
+		goto out_free;
+	}
+
+	/* 1. detach every range from the vma tree */
+	for (i = 0; i < nr; i++) {
+		struct vm_area_struct *vma;
+
+		mt_init_flags(&mts[i], mm->mm_mt.ma_flags & MT_FLAGS_LOCK_MASK);
+		mt_on_stack(mts[i]);
+		mas_init(&mas[i], &mts[i], 0);
+		vma_iter_init(&vmis[i], mm, rng[i].start);
+		vma = vma_find(&vmis[i], rng[i].end);
+		init_vma_munmap(&vms[i], &vmis[i], vma, rng[i].start, rng[i].end, uf, false);
+		if (!vma) {
+			done = i + 1;
+			continue;	/* nothing mapped there, like munmap() */
+		}
+		error = vms_gather_munmap_vmas(&vms[i], &mas[i]);
+		if (error)
+			break;		/* gather reattached its vmas */
+		error = vma_iter_clear_gfp(&vmis[i], rng[i].start, rng[i].end, GFP_KERNEL);
+		if (error) {
+			reattach_vmas(&mas[i]);
+			break;
+		}
+		done = i + 1;
+	}
+	if (!done) {
+		mmap_write_unlock(mm);
+		goto out_free;
+	}
+
+	/* 2. write-locked accounting, then live neighbours for the page table frees */
+	for (i = 0; i < done; i++) {
+		struct vm_area_struct *prev, *next;
+
+		if (!vms[i].vma)
+			continue;
+		mm->map_count -= vms[i].vma_count;
+		mm->locked_vm -= vms[i].locked_vm;
+		vma_iter_init(&vmis[i], mm, vms[i].start);
+		prev = vma_prev(&vmis[i]);
+		vms[i].unmap_start = prev ? prev->vm_end : FIRST_USER_ADDRESS;
+		vma_iter_init(&vmis[i], mm, vms[i].end);
+		next = vma_next(&vmis[i]);
+		vms[i].unmap_end = next ? next->vm_start : USER_PGTABLES_CEILING;
+		live_end[i] = next ? next->vm_start : ULONG_MAX;
+	}
+	mmap_write_downgrade(mm);
+
+	/*
+	 * 3. one gather: zap the PTEs of every range first, then free the page
+	 * tables. Page tables may be shared between ranges of the batch (a PTE
+	 * table at a boundary, a PMD table spanning several ranges), so each
+	 * range first frees only what lies strictly inside it, and the tables
+	 * left on the seams and above are freed per run of ranges that have no
+	 * live mapping between them, against the live neighbours.
+	 */
+	tlb_gather_mmu(&tlb, mm);
+	update_hiwater_rss(mm);
+	for (i = 0; i < done; i++) {
+		struct unmap_desc unmap = {
+			.mas = &mas[i],
+			.first = vms[i].vma,
+			.vma_start = vms[i].start,
+			.vma_end = vms[i].end,
+			.tree_end = vms[i].vma_count,
+			.mm_wr_locked = false,
+		};
+
+		if (!vms[i].vma || !vms[i].clear_ptes)
+			continue;
+		mas_set(&mas[i], 1);
+		unmap_vmas(&tlb, &unmap);
+	}
+	prev_real = -1;
+	for (i = 0; i < done; i++) {
+		struct unmap_desc unmap = {
+			.mas = &mas[i],
+			.first = vms[i].vma,
+			.pg_start = vms[i].unmap_start,
+			.pg_end = vms[i].unmap_end,
+			.vma_start = vms[i].start,
+			.vma_end = vms[i].end,
+			.tree_reset = 1,
+			.tree_end = vms[i].vma_count,
+			.mm_wr_locked = false,
+		};
+		unsigned int j;
+
+		if (!vms[i].vma || !vms[i].clear_ptes)
+			continue;
+		/* the previous/next range of the same run bounds what is ours alone */
+		if (prev_real >= 0 && live_end[prev_real] > vms[i].start)
+			unmap.pg_start = vms[i].start;
+		for (j = i + 1; j < done && !vms[j].vma; j++)
+			;
+		if (j < done && live_end[i] > vms[j].start)
+			unmap.pg_end = vms[i].end;
+		mas_set(&mas[i], unmap.tree_reset);
+		free_pgtables(&tlb, &unmap);
+		vms[i].clear_ptes = false;
+		prev_real = i;
+	}
+	/* seams and upper levels, once per run */
+	for (i = 0; i < done; i = j) {
+		unsigned int last;
+
+		for (j = i; j < done && !vms[j].vma; j++)
+			;
+		if (j == done)
+			break;
+		i = last = j;
+		for (j = i + 1; j < done; j++) {
+			if (!vms[j].vma)
+				continue;
+			if (live_end[last] <= vms[j].start)
+				break;
+			last = j;
+		}
+		free_pgd_range(&tlb, vms[i].start, vms[last].end,
+			       vms[i].unmap_start, vms[last].unmap_end);
+	}
+	tlb_finish_mmu(&tlb);
+
+	/* 4. the rest of vms_complete_munmap_vmas() per range */
+	for (i = 0; i < done; i++) {
+		struct vm_area_struct *vma;
+
+		if (!vms[i].vma)
+			continue;
+		if (vms[i].nr_pages) {
+			update_hiwater_vm(mm);
+			WRITE_ONCE(mm->total_vm, READ_ONCE(mm->total_vm) - vms[i].nr_pages);
+			VM_WARN_ON(vms[i].exec_vm > mm->exec_vm);
+			VM_WARN_ON(vms[i].stack_vm > mm->stack_vm);
+			VM_WARN_ON(vms[i].data_vm > mm->data_vm);
+			mm->exec_vm -= vms[i].exec_vm;
+			mm->stack_vm -= vms[i].stack_vm;
+			mm->data_vm -= vms[i].data_vm;
+			mas_set(&mas[i], 0);
+			mas_for_each(&mas[i], vma, ULONG_MAX)
+				remove_vma(vma);
+			vm_unacct_memory(vms[i].nr_accounted);
+		}
+		__mt_destroy(&mts[i]);
+	}
+	mmap_read_unlock(mm);
+out_free:
+	kvfree(vms);
+	kvfree(vmis);
+	kvfree(mts);
+	kvfree(mas);
+	kvfree(live_end);
+	return error;
+}
+
+/*
  * do_vmi_munmap() - munmap a given range.
  * @vmi: The vma iterator
  * @mm: The mm_struct

@@ -13,6 +13,7 @@
 #include <linux/slab.h>
 #include <linux/backing-dev.h>
 #include <linux/mm.h>
+#include <linux/sort.h>
 #include <linux/mm_inline.h>
 #include <linux/shm.h>
 #include <linux/mman.h>
@@ -1092,6 +1093,69 @@ SYSCALL_DEFINE2(munmap, unsigned long, addr, size_t, len)
 {
 	addr = untagged_addr(addr);
 	return __vm_munmap(addr, len, true);
+}
+
+static int munmapv_range_cmp(const void *a, const void *b)
+{
+	const struct munmapv_range *x = a, *y = b;
+
+	return x->start < y->start ? -1 : x->start > y->start;
+}
+
+/*
+ * munmapv(iov, nr): munmap() every iovec in one go, with one page table walk
+ * and one TLB shootdown instead of one per range. Ranges must not overlap.
+ */
+SYSCALL_DEFINE2(munmapv, const struct iovec __user *, uvec, unsigned int, nr)
+{
+	struct mm_struct *mm = current->mm;
+	struct munmapv_range *rng;
+	struct iovec *iov;
+	unsigned int i;
+	int ret;
+	LIST_HEAD(uf);
+
+	if (!nr || nr > MUNMAPV_MAX)
+		return -EINVAL;
+	iov = kvmalloc_array(nr, sizeof(*iov), GFP_KERNEL);
+	rng = kvmalloc_array(nr, sizeof(*rng), GFP_KERNEL);
+	if (!iov || !rng) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	if (copy_from_user(iov, uvec, nr * sizeof(*iov))) {
+		ret = -EFAULT;
+		goto out;
+	}
+	for (i = 0; i < nr; i++) {
+		unsigned long start = untagged_addr((unsigned long)iov[i].iov_base);
+		size_t len = iov[i].iov_len;
+
+		if (offset_in_page(start) || !len || start > TASK_SIZE ||
+		    len > TASK_SIZE - start) {
+			ret = -EINVAL;
+			goto out;
+		}
+		rng[i].start = start;
+		rng[i].end = start + PAGE_ALIGN(len);
+	}
+	sort(rng, nr, sizeof(*rng), munmapv_range_cmp, NULL);
+	for (i = 1; i < nr; i++) {
+		if (rng[i].start < rng[i - 1].end) {
+			ret = -EINVAL;
+			goto out;
+		}
+	}
+	if (mmap_write_lock_killable(mm)) {
+		ret = -EINTR;
+		goto out;
+	}
+	ret = do_munmapv(mm, rng, nr, &uf);	/* drops the lock */
+	userfaultfd_unmap_complete(mm, &uf);
+out:
+	kvfree(iov);
+	kvfree(rng);
+	return ret;
 }
 
 

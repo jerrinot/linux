@@ -412,6 +412,13 @@ do_vmi_align_munmap(struct vma_iterator *vmi, struct vm_area_struct *vma,
 		    struct mm_struct *mm, unsigned long start,
 		    unsigned long end, struct list_head *uf, bool unlock);
 
+struct munmapv_range {
+	unsigned long start;
+	unsigned long end;
+};
+#define MUNMAPV_MAX 1024
+int do_munmapv(struct mm_struct *mm, struct munmapv_range *rng, unsigned int nr,
+	       struct list_head *uf);
 int do_vmi_munmap(struct vma_iterator *vmi, struct mm_struct *mm,
 		  unsigned long start, size_t len, struct list_head *uf,
 		  bool unlock);
