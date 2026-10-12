@@ -3,6 +3,7 @@
 #include <linux/highmem.h>
 #include <linux/kernel.h>
 #include <linux/mmdebug.h>
+#include <linux/moduleparam.h>
 #include <linux/mm_types.h>
 #include <linux/mm_inline.h>
 #include <linux/pagemap.h>
@@ -16,6 +17,13 @@
 #include <asm/tlb.h>
 
 #ifndef CONFIG_MMU_GATHER_NO_GATHER
+
+/*
+ * Experiment: make the batch cap a runtime knob (default = upstream
+ * MAX_GATHER_BATCH_COUNT, i.e. ~10k pages between forced flushes).
+ */
+static unsigned int tlb_gather_max_batches __read_mostly = MAX_GATHER_BATCH_COUNT;
+core_param(tlb_gather_max_batches, tlb_gather_max_batches, uint, 0644);
 
 static bool tlb_next_batch(struct mmu_gather *tlb)
 {
@@ -31,7 +39,7 @@ static bool tlb_next_batch(struct mmu_gather *tlb)
 		return true;
 	}
 
-	if (tlb->batch_count == MAX_GATHER_BATCH_COUNT)
+	if (tlb->batch_count >= READ_ONCE(tlb_gather_max_batches))
 		return false;
 
 	batch = (void *)__get_free_page(GFP_NOWAIT);
