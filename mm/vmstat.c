@@ -1479,6 +1479,8 @@ const char * const vmstat_text[] = {
 	[I(VMA_LOCK_RETRY)]			= "vma_lock_retry",
 	[I(VMA_LOCK_MISS)]			= "vma_lock_miss",
 #endif
+	[I(TLB_DIRTY_DEFER_TABLES)]		= "tlb_dirty_defer_tables",
+	[I(TLB_DIRTY_HOOK_FLUSH)]		= "tlb_dirty_hook_flush",
 #ifdef CONFIG_DEBUG_STACK_USAGE
 	[I(KSTACK_1K)]				= "kstack_1k",
 #if THREAD_SIZE > 1024

@@ -1770,7 +1770,8 @@ static __always_inline void zap_present_folio_ptes(struct mmu_gather *tlb,
 		struct vm_area_struct *vma, struct folio *folio,
 		struct page *page, pte_t *pte, pte_t ptent, unsigned int nr,
 		unsigned long addr, struct zap_details *details, int *rss,
-		bool *force_flush, bool *force_break, bool *any_skipped)
+		bool *force_flush, bool *force_break, bool *any_skipped,
+		struct tlb_dirty_state *st)
 {
 	struct mm_struct *mm = tlb->mm;
 	bool delay_rmap = false;
@@ -1779,10 +1780,19 @@ static __always_inline void zap_present_folio_ptes(struct mmu_gather *tlb,
 		ptent = get_and_clear_full_ptes(mm, addr, pte, nr, tlb->fullmm);
 		if (pte_dirty(ptent)) {
 			folio_mark_dirty(folio);
-			if (tlb_delay_rmap(tlb)) {
+			/*
+			 * Inside a tlb_dirty_begin() bracket the flush is left
+			 * to the gather and writeback flushes on our behalf;
+			 * otherwise keep the rmap until the forced flush.
+			 */
+			if (!st && tlb_delay_rmap(tlb)) {
 				delay_rmap = true;
 				*force_flush = true;
 			}
+			/* the bracket is keyed by the VMA's file: a folio of another mapping would be unprotected */
+			VM_WARN_ON_ONCE(st && folio->mapping &&
+					!((unsigned long)folio->mapping & FOLIO_MAPPING_FLAGS) &&
+					folio->mapping != vma->vm_file->f_mapping);
 		}
 		if (pte_young(ptent) && likely(vma_has_recency(vma)))
 			folio_mark_accessed(folio);
@@ -1821,7 +1831,8 @@ static inline int zap_present_ptes(struct mmu_gather *tlb,
 		struct vm_area_struct *vma, pte_t *pte, pte_t ptent,
 		unsigned int max_nr, unsigned long addr,
 		struct zap_details *details, int *rss, bool *force_flush,
-		bool *force_break, bool *any_skipped)
+		bool *force_break, bool *any_skipped,
+		struct tlb_dirty_state *st)
 {
 	struct mm_struct *mm = tlb->mm;
 	struct folio *folio;
@@ -1855,11 +1866,12 @@ static inline int zap_present_ptes(struct mmu_gather *tlb,
 		nr = folio_pte_batch(folio, pte, ptent, max_nr);
 		zap_present_folio_ptes(tlb, vma, folio, page, pte, ptent, nr,
 				       addr, details, rss, force_flush,
-				       force_break, any_skipped);
+				       force_break, any_skipped, st);
 		return nr;
 	}
 	zap_present_folio_ptes(tlb, vma, folio, page, pte, ptent, 1, addr,
-			       details, rss, force_flush, force_break, any_skipped);
+			       details, rss, force_flush, force_break, any_skipped,
+			       st);
 	return 1;
 }
 
@@ -1939,7 +1951,7 @@ static inline int do_zap_pte_range(struct mmu_gather *tlb,
 				   unsigned long addr, unsigned long end,
 				   struct zap_details *details, int *rss,
 				   bool *force_flush, bool *force_break,
-				   bool *any_skipped)
+				   bool *any_skipped, struct tlb_dirty_state *st)
 {
 	pte_t ptent = ptep_get(pte);
 	int max_nr = (end - addr) / PAGE_SIZE;
@@ -1962,7 +1974,7 @@ static inline int do_zap_pte_range(struct mmu_gather *tlb,
 	if (pte_present(ptent))
 		nr += zap_present_ptes(tlb, vma, pte, ptent, max_nr, addr,
 				       details, rss, force_flush, force_break,
-				       any_skipped);
+				       any_skipped, st);
 	else
 		nr += zap_nonpresent_ptes(tlb, vma, pte, ptent, max_nr, addr,
 					  details, rss, any_skipped);
@@ -2036,6 +2048,7 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
 	bool can_reclaim_pt = pte_table_reclaim_possible(addr, end, details);
 	bool force_flush = false, force_break = false;
 	struct mm_struct *mm = tlb->mm;
+	struct tlb_dirty_state *st;
 	int rss[NR_MM_COUNTERS];
 	spinlock_t *ptl;
 	pte_t *start_pte;
@@ -2053,6 +2066,7 @@ retry:
 		return addr;
 
 	flush_tlb_batched_pending(mm);
+	st = tlb_dirty_begin(tlb, vma);
 	lazy_mmu_mode_enable();
 	do {
 		bool any_skipped = false;
@@ -2063,7 +2077,8 @@ retry:
 		}
 
 		nr = do_zap_pte_range(tlb, vma, pte, addr, end, details, rss,
-				      &force_flush, &force_break, &any_skipped);
+				      &force_flush, &force_break, &any_skipped,
+				      st);
 		if (any_skipped)
 			can_reclaim_pt = false;
 		if (unlikely(force_break)) {
@@ -2092,6 +2107,7 @@ retry:
 		tlb_flush_mmu_tlbonly(tlb);
 		tlb_flush_rmaps(tlb, vma);
 	}
+	tlb_dirty_end(tlb, st);
 	pte_unmap_unlock(start_pte, ptl);
 
 	/*

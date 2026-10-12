@@ -2900,7 +2900,7 @@ bool folio_clear_dirty_for_io(struct folio *folio)
 		 * as a serialization point for all the different
 		 * threads doing their things.
 		 */
-		if (folio_mkclean(folio))
+		if (__folio_mkclean(folio))	/* tlb_dirty_flush_pending() runs below */
 			folio_mark_dirty(folio);
 		/*
 		 * We carefully synchronise fault handlers against
@@ -2921,9 +2921,26 @@ bool folio_clear_dirty_for_io(struct folio *folio)
 			ret = true;
 		}
 		unlocked_inode_to_wb_end(inode, &cookie);
+		/*
+		 * A zap may have cleared dirty PTEs of this folio and left the
+		 * TLB flush to its gather (see tlb_dirty_begin()): flush before
+		 * the I/O reads data a CPU may still be writing.
+		 */
+		if (ret)
+			tlb_dirty_flush_pending(mapping);
 		return ret;
 	}
-	return folio_test_clear_dirty(folio);
+	if (folio_test_clear_dirty(folio)) {
+		/*
+		 * shmem pageout(): unreachable while a deferred clear is pending,
+		 * because the zapper's gather holds the folio reference that
+		 * pageout() requires to be gone; kept as a guard for other callers.
+		 */
+		if (mapping && !folio_test_anon(folio) && !folio_test_swapcache(folio))
+			tlb_dirty_flush_pending(mapping);
+		return true;
+	}
+	return false;
 }
 EXPORT_SYMBOL(folio_clear_dirty_for_io);
 

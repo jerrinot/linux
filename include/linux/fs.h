@@ -449,6 +449,16 @@ struct mapping_metadata_bhs {
 	struct list_head list;	/* The list of bhs (b_assoc_buffers) */
 };
 
+/*
+ * Per-mapping record of PTE tables whose dirty shared PTEs were zapped without
+ * a TLB flush: (generation << TLB_DIRTY_GEN_SHIFT) | open tables, and the last
+ * closed state at which writeback flushed. Maintained by mm/rmap.c.
+ */
+struct tlb_dirty_state {
+	atomic64_t	state;
+	atomic64_t	flushed;
+};
+
 /**
  * struct address_space - Contents of a cacheable, mappable object.
  * @host: Owner, either the inode or the block_device.
@@ -482,6 +492,9 @@ struct address_space {
 	errseq_t		wb_err;
 	spinlock_t		i_private_lock;
 	struct rw_semaphore	i_mmap_rwsem;
+#ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+	struct tlb_dirty_state	tlb_dirty;	/* zapped dirty PTEs awaiting a TLB flush, see mm/rmap.c */
+#endif
 } __attribute__((aligned(sizeof(long)))) __randomize_layout;
 	/*
 	 * On most architectures that alignment is already the case; but

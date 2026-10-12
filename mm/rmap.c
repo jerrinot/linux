@@ -827,6 +827,188 @@ void flush_tlb_batched_pending(struct mm_struct *mm)
 			       pending | (pending << TLB_FLUSH_BATCH_FLUSHED_SHIFT));
 	}
 }
+
+/*
+ * Deferred TLB flush for zapped dirty PTEs of writable shared file mappings.
+ *
+ * zap_present_folio_ptes() used to force a TLB flush before the PTL is dropped
+ * whenever it cleared a dirty PTE of a file folio (commit 5df397dec7c4), so
+ * that folio_mkclean() and folio_clear_dirty_for_io(), which walk the rmap
+ * under the PTL, never find a clean folio while some CPU still writes through
+ * a stale dirty TLB entry. That is one IPI round per PTE table of a large dirty
+ * mapping.
+ *
+ * Instead, the rmap is removed under the PTL exactly as for clean pages, the
+ * flush is left to the mmu_gather, and the two cleaning sites flush on the
+ * zapper's behalf while it matters. Every PTL hold of zap_pte_range() or
+ * zap_huge_pmd() on a writable shared file VMA brackets itself on the
+ * mapping's tlb_dirty_state: tlb_dirty_begin() counts the table as open,
+ * tlb_dirty_end() closes it and bumps the generation, both in one word.
+ * Whoever is about to trust a folio clean or stable calls
+ * tlb_dirty_flush_pending(folio->mapping): it flushes when a table of the
+ * mapping is open, or when a table was closed since a hook last flushed, and
+ * records only closed states. Every PTE clear precedes the generation bump of
+ * its table, so a recorded state never has an unflushed clear behind it,
+ * however many zappers interleave.
+ *
+ * The flush targets the union of the mm_cpumask()s of every mm that ever
+ * zapped this way (grow-only, like reclaim's tlb_ubc but global), captured
+ * after the clears so CPUs that joined the mm meanwhile are included, right
+ * after the mm's TLB generation was advanced so that every such CPU
+ * invalidates on the IPI or when it resumes the mm: CPUs that never ran such
+ * an mm are never interrupted. A hook that finds a table still open
+ * cannot know the joiners yet and flushes everything. Reclaim (set_tlb_ubc_flush_pending) defers the flush of
+ * dirty PTEs in the same spirit; zap_huge_pmd() has always left the flush of
+ * a dirty PMD to the gather.
+ *
+ * Invariant for everybody else: a stale dirty entry behaves like a live
+ * writable PTE until the next folio_mkclean()/folio_clear_dirty_for_io() on
+ * folio->mapping, which is what every consumer already tolerated for a live
+ * mapping. Truncate, reclaim, migration and split are unaffected because the
+ * gather holds the folio reference until after its own flush. DAX keeps the
+ * PTL-synchronous path (dax_entry_mkclean), fullmm has no user CPUs left.
+ */
+#define TLB_DIRTY_GEN_SHIFT	24	/* open tables < PID_MAX_LIMIT even on RT */
+#define TLB_DIRTY_OPEN_MASK	((1ULL << TLB_DIRTY_GEN_SHIFT) - 1)
+#define TLB_DIRTY_GEN		(1ULL << TLB_DIRTY_GEN_SHIFT)
+
+/* CPUs that may hold a stale entry: union of the zapping mms' cpumasks, grow-only. */
+static struct cpumask tlb_dirty_cpus __read_mostly;
+
+static void tlb_dirty_cpus_add(const struct cpumask *src)
+{
+	unsigned int cpu;
+
+	if (likely(cpumask_subset(src, &tlb_dirty_cpus)))
+		return;
+	for_each_cpu(cpu, src)
+		if (!cpumask_test_cpu(cpu, &tlb_dirty_cpus))
+			cpumask_set_cpu(cpu, &tlb_dirty_cpus);
+}
+
+/*
+ * Called with the PTL (or PMD lock) held, before the first PTE of the table is
+ * cleared. Returns NULL when the VMA keeps the upstream per-table flush:
+ * anything that cannot hold dirty shared PTEs of page-cache folios, DAX
+ * (dax_entry_mkclean relies on the PTL) and fullmm.
+ */
+struct tlb_dirty_state *tlb_dirty_begin(struct mmu_gather *tlb,
+					struct vm_area_struct *vma)
+{
+	struct tlb_dirty_state *st;
+
+	if (tlb->fullmm || !vma->vm_file ||
+	    (vma->vm_flags & (VM_SHARED | VM_MAYWRITE | VM_PFNMAP | VM_IO)) !=
+	    (VM_SHARED | VM_MAYWRITE) || vma_is_dax(vma))
+		return NULL;
+
+	st = &vma->vm_file->f_mapping->tlb_dirty;
+	atomic64_inc(&st->state);
+	/*
+	 * Pairs with smp_rmb() in tlb_dirty_flush_pending(): the open table is
+	 * visible before any PTE clear, folio_mark_dirty() or rmap removal of
+	 * this table can be observed.
+	 */
+	smp_mb__after_atomic();
+	count_vm_event(TLB_DIRTY_DEFER_TABLES);
+	return st;
+}
+
+/* Called before the PTL is dropped. */
+void tlb_dirty_end(struct mmu_gather *tlb, struct tlb_dirty_state *st)
+{
+	if (!st)
+		return;
+	/*
+	 * Order matters, as in arch_tlbbatch_add_pending(): the PTE clears are
+	 * done, so now (1) publish a new TLB generation of the mm, so that a
+	 * CPU which observed the old one while filling an entry we have just
+	 * cleared invalidates on the hook's IPI or when it resumes the mm,
+	 * (2) capture the CPUs that may hold such an entry, including those
+	 * that joined the mm after tlb_dirty_begin(), (3) count the table as
+	 * closed.
+	 */
+#ifdef CONFIG_X86
+	inc_mm_tlb_gen(tlb->mm);
+#endif
+	tlb_dirty_cpus_add(mm_cpumask(tlb->mm));
+	/* Every clear of this table is visible before it counts as closed. */
+	smp_mb__before_atomic();
+	atomic64_add(TLB_DIRTY_GEN - 1, &st->state);
+}
+
+/* Compare as unsigned: the generation lives in the high bits and may set bit 63. */
+static void tlb_dirty_advance(atomic64_t *flushed, u64 v)
+{
+	s64 f = atomic64_read(flushed);
+
+	while ((u64)f < v && !atomic64_try_cmpxchg(flushed, &f, (s64)v))
+		;
+}
+
+#ifdef CONFIG_X86
+/* arch_tlbbatch_flush() consumes the batch, so refill it under a mutex rather than copying a cpumask onto the stack. */
+static DEFINE_MUTEX(tlb_dirty_flush_lock);
+static struct arch_tlbflush_unmap_batch tlb_dirty_batch;
+
+static void tlb_dirty_flush(void)
+{
+	mutex_lock(&tlb_dirty_flush_lock);
+	cpumask_copy(&tlb_dirty_batch.cpumask, &tlb_dirty_cpus);
+	tlb_dirty_batch.unmapped_pages = true;
+	arch_tlbbatch_flush(&tlb_dirty_batch);
+	mutex_unlock(&tlb_dirty_flush_lock);
+}
+#else
+static void tlb_dirty_flush(void)
+{
+	flush_tlb_all();
+}
+#endif
+
+/*
+ * tlb_dirty_flush_pending - flush stale writable TLB entries of zapped PTEs
+ * @mapping: folio->mapping of a folio the caller is about to trust clean
+ *
+ * Call after the observation the caller relies on (clearing PG_dirty, or
+ * finding the folio unmapped) and before using the data. Process context,
+ * interrupts enabled.
+ */
+void tlb_dirty_flush_pending(struct address_space *mapping)
+{
+	struct tlb_dirty_state *st = &mapping->tlb_dirty;
+	u64 v, f;
+
+	/*
+	 * Pairs with smp_mb__after_atomic() in tlb_dirty_begin(). Needed when
+	 * the caller's observation is a plain load (folio_mapped() in
+	 * folio_mkclean()); a value-returning RMW such as
+	 * folio_test_clear_dirty() is already fully ordered.
+	 */
+	smp_rmb();
+	v = (u64)atomic64_read(&st->state);
+	/*
+	 * Acquire pairs with the try_cmpxchg in tlb_dirty_advance() of the hook
+	 * that recorded f after its flush: if we skip, our data accesses are
+	 * ordered after that flush.
+	 */
+	f = (u64)atomic64_read_acquire(&st->flushed);
+	if (likely(!(v & TLB_DIRTY_OPEN_MASK) && f >= v))
+		return;
+
+	/*
+	 * While a table is open its zapper has not re-added the cpumask yet,
+	 * so a CPU that joined the mm meanwhile may hold a stale entry: flush
+	 * everything in that (microsecond) window, the targeted mask otherwise.
+	 */
+	if (v & TLB_DIRTY_OPEN_MASK)
+		flush_tlb_all();
+	else
+		tlb_dirty_flush();
+	count_vm_event(TLB_DIRTY_HOOK_FLUSH);
+	if (!(v & TLB_DIRTY_OPEN_MASK))
+		tlb_dirty_advance(&st->flushed, v);
+}
 #else
 static void set_tlb_ubc_flush_pending(struct mm_struct *mm, pte_t pteval,
 		unsigned long start, unsigned long end)
@@ -1218,10 +1400,14 @@ static bool invalid_mkclean_vma(struct vm_area_struct *vma, void *arg)
 	return true;
 }
 
-int folio_mkclean(struct folio *folio)
+/*
+ * Write-protect and clean every PTE mapping the folio, without the deferred
+ * TLB flush below; for folio_clear_dirty_for_io(), which calls
+ * tlb_dirty_flush_pending() itself after clearing the dirty bit.
+ */
+int __folio_mkclean(struct folio *folio)
 {
 	int cleaned = 0;
-	struct address_space *mapping;
 	struct rmap_walk_control rwc = {
 		.arg = (void *)&cleaned,
 		.rmap_one = page_mkclean_one,
@@ -1230,14 +1416,33 @@ int folio_mkclean(struct folio *folio)
 
 	BUG_ON(!folio_test_locked(folio));
 
-	if (!folio_mapped(folio))
-		return 0;
-
-	mapping = folio_mapping(folio);
-	if (!mapping)
+	if (!folio_mapped(folio) || !folio_mapping(folio))
 		return 0;
 
 	rmap_walk(folio, &rwc);
+
+	return cleaned;
+}
+EXPORT_SYMBOL_GPL(__folio_mkclean);
+
+int folio_mkclean(struct folio *folio)
+{
+	struct address_space *mapping = folio_mapping(folio);
+	int cleaned;
+
+	BUG_ON(!folio_test_locked(folio));
+
+	if (!mapping)
+		return 0;
+
+	cleaned = __folio_mkclean(folio);
+
+	/*
+	 * A zap may have cleared dirty PTEs of this folio and left the TLB
+	 * flush to its mmu_gather (see tlb_dirty_begin()); callers rely on no
+	 * writable mapping surviving this call, stale TLB entries included.
+	 */
+	tlb_dirty_flush_pending(mapping);
 
 	return cleaned;
 }
@@ -1313,6 +1518,8 @@ int mapping_wrprotect_range(struct address_space *mapping, pgoff_t pgoff,
 
 	__rmap_walk_file(/* folio = */NULL, mapping, pgoff, nr_pages, &rwc,
 			 /* locked = */false);
+	/* fb_defio copies the pages right after this; no stale writable entry may survive */
+	tlb_dirty_flush_pending(mapping);
 
 	return state.cleaned;
 }

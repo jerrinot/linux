@@ -2549,6 +2549,7 @@ bool zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 {
 	struct mm_struct *mm = tlb->mm;
 	struct folio *folio = NULL;
+	struct tlb_dirty_state *st;
 	bool is_present = false;
 	bool has_deposit;
 	spinlock_t *ptl;
@@ -2559,6 +2560,11 @@ bool zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 	ptl = __pmd_trans_huge_lock(pmd, vma);
 	if (!ptl)
 		return false;
+	/*
+	 * The flush of a dirty shared PMD has always been left to the gather;
+	 * the bracket lets writeback flush on our behalf meanwhile.
+	 */
+	st = tlb_dirty_begin(tlb, vma);
 	/*
 	 * For architectures like ppc64 we look at deposited pgtable
 	 * when calling pmdp_huge_get_and_clear. So do the
@@ -2578,6 +2584,7 @@ bool zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
 	if (has_deposit)
 		zap_deposited_table(mm, pmd);
 
+	tlb_dirty_end(tlb, st);
 	spin_unlock(ptl);
 	if (is_present && folio)
 		tlb_remove_page_size(tlb, &folio->page, HPAGE_PMD_SIZE);

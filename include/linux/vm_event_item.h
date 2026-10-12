@@ -151,6 +151,8 @@ enum vm_event_item { PGPGIN, PGPGOUT, PSWPIN, PSWPOUT,
 		VMA_LOCK_RETRY,
 		VMA_LOCK_MISS,
 #endif
+		TLB_DIRTY_DEFER_TABLES,	/* PTE tables/PMDs zapped with deferred dirty flush */
+		TLB_DIRTY_HOOK_FLUSH,	/* flush_tlb_all() from writeback/mkclean on their behalf */
 #ifdef CONFIG_DEBUG_STACK_USAGE
 		KSTACK_1K,
 #if THREAD_SIZE > 1024

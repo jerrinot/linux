@@ -1214,10 +1214,17 @@ struct tlbflush_unmap_batch;
  */
 extern struct workqueue_struct *mm_percpu_wq;
 
+struct mmu_gather;
+struct tlb_dirty_state;
+
 #ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
 void try_to_unmap_flush(void);
 void try_to_unmap_flush_dirty(void);
 void flush_tlb_batched_pending(struct mm_struct *mm);
+struct tlb_dirty_state *tlb_dirty_begin(struct mmu_gather *tlb,
+					struct vm_area_struct *vma);
+void tlb_dirty_end(struct mmu_gather *tlb, struct tlb_dirty_state *st);
+void tlb_dirty_flush_pending(struct address_space *mapping);
 #else
 static inline void try_to_unmap_flush(void)
 {
@@ -1226,6 +1233,18 @@ static inline void try_to_unmap_flush_dirty(void)
 {
 }
 static inline void flush_tlb_batched_pending(struct mm_struct *mm)
+{
+}
+static inline struct tlb_dirty_state *tlb_dirty_begin(struct mmu_gather *tlb,
+						      struct vm_area_struct *vma)
+{
+	return NULL;
+}
+static inline void tlb_dirty_end(struct mmu_gather *tlb,
+				 struct tlb_dirty_state *st)
+{
+}
+static inline void tlb_dirty_flush_pending(struct address_space *mapping)
 {
 }
 #endif /* CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH */
