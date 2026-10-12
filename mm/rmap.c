@@ -1108,12 +1108,24 @@ int folio_referenced(struct folio *folio, int is_locked,
 	return rwc.contended ? -1 : pra.referenced;
 }
 
+/*
+ * Write-protect and clean the PTEs of the folio in one VMA. The PTEs are
+ * changed like mprotect() changes them, ptep_modify_prot_start()/commit()
+ * under the PTL with the TLB flush gathered and issued once at the end,
+ * instead of ptep_clear_flush() per PTE. Until that flush a CPU may still
+ * write through a stale writable entry, but only into a folio that the
+ * caller holds locked and still dirty, and the flush is complete before
+ * this function returns, which is what folio_mkclean() promises. A stale
+ * entry without the dirty bit must re-walk on write and faults on the
+ * read-only PTE (x86 SDM 4.10.2.3; arm64 pte_wrprotect() clears DBM).
+ */
 static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw)
 {
 	int cleaned = 0;
 	struct vm_area_struct *vma = pvmw->vma;
 	struct mmu_notifier_range range;
 	unsigned long address = pvmw->address;
+	struct mmu_gather tlb;
 
 	/*
 	 * We have to assume the worse case ie pmd for invalidation. Note that
@@ -1122,6 +1134,7 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw)
 	mmu_notifier_range_init(&range, MMU_NOTIFY_PROTECTION_PAGE, 0,
 				vma->vm_mm, address, vma_address_end(pvmw));
 	mmu_notifier_invalidate_range_start(&range);
+	tlb_gather_mmu_vma(&tlb, vma);
 
 	while (page_vma_mapped_walk(pvmw)) {
 		int ret = 0;
@@ -1143,10 +1156,10 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw)
 				continue;
 
 			flush_cache_page(vma, address, pte_pfn(entry));
-			entry = ptep_clear_flush(vma, address, pte);
-			entry = pte_wrprotect(entry);
-			entry = pte_mkclean(entry);
-			set_pte_at(vma->vm_mm, address, pte, entry);
+			entry = ptep_modify_prot_start(vma, address, pte);
+			ptep_modify_prot_commit(vma, address, pte, entry,
+						pte_mkclean(pte_wrprotect(entry)));
+			tlb_flush_pte_range(&tlb, address, PAGE_SIZE);
 			ret = 1;
 		} else {
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
@@ -1180,6 +1193,7 @@ static int page_vma_mkclean_one(struct page_vma_mapped_walk *pvmw)
 			cleaned++;
 	}
 
+	tlb_finish_mmu(&tlb);
 	mmu_notifier_invalidate_range_end(&range);
 
 	return cleaned;
