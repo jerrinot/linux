@@ -3003,6 +3003,13 @@ static struct uniwill_device_descriptor phxarxx_phxaqxx_descriptor __initdata = 
 	.probe = phxarxx_phxaqxx_probe,
 };
 
+static struct uniwill_device_descriptor schenker_vision_14_e22_descriptor __initdata = {
+	.features = UNIWILL_FEATURE_USB_C_POWER_PRIORITY |
+		    UNIWILL_FEATURE_KEYBOARD_BACKLIGHT,
+	.kbd_led_single_color = true,
+	.kbd_led_max_brightness = 2,
+};
+
 static struct uniwill_device_descriptor pfxpuxx_descriptor __initdata = {
 	.features = UNIWILL_FEATURE_FN_LOCK |
 		    UNIWILL_FEATURE_SUPER_KEY |
@@ -3028,6 +3035,15 @@ static struct uniwill_device_descriptor x4sp4nal_descriptor __initdata = {
 };
 
 static const struct dmi_system_id uniwill_dmi_table[] __initconst = {
+	{
+		.ident = "SCHENKER VISION 14 (E22)",
+		.matches = {
+			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "SchenkerTechnologiesGmbH"),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "SCHENKER VISION (E22)"),
+			DMI_EXACT_MATCH(DMI_BOARD_NAME, "PHxARX1_PHxAQF1"),
+		},
+		.driver_data = &schenker_vision_14_e22_descriptor,
+	},
 	{
 		.ident = "AiStone X4SP4NAL",
 		.matches = {
