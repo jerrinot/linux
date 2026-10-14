@@ -873,6 +873,22 @@ static const struct dmi_system_id intel_no_opregion_vbt[] = {
 	{ }
 };
 
+/*
+ * Machines whose firmware cannot acknowledge the graphics SCI: the DSDT
+ * _L06 handler clears TCO1_STS.DMISCI_STS at the wrong I/O port, so the
+ * first SWSCI request leaves GPE 0x06 asserted forever (~7000 SCIs/s).
+ */
+static const struct dmi_system_id intel_no_opregion_swsci[] = {
+	{
+		.ident = "Apple MacBookPro11,3",
+		.matches = {
+			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Apple Inc."),
+			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "MacBookPro11,3"),
+		},
+	},
+	{ }
+};
+
 int intel_opregion_setup(struct intel_display *display)
 {
 	struct intel_opregion *opregion;
@@ -945,6 +961,8 @@ int intel_opregion_setup(struct intel_display *display)
 
 		if (major >= 3) {
 			drm_err(display->drm, "SWSCI Mailbox #2 present for opregion v3.x, ignoring\n");
+		} else if (dmi_check_system(intel_no_opregion_swsci)) {
+			drm_dbg(display->drm, "SWSCI present but firmware cannot ack the SCI, ignoring\n");
 		} else {
 			if (major >= 2)
 				drm_dbg(display->drm, "SWSCI Mailbox #2 present for opregion v2.x\n");
